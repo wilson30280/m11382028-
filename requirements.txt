@@ -2,3 +2,4 @@ Flask
 opencv-python-headless
 requests
 beautifulsoup4
+gunicorn
