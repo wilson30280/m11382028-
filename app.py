@@ -1,4 +1,4 @@
-from flask import Flask, Response, render_template_string, url_for
+from flask import Flask, Response, render_template_string
 import cv2
 import requests
 from bs4 import BeautifulSoup
@@ -8,108 +8,105 @@ app = Flask(__name__)
 # 學號與基本資訊
 STUDENT_ID = "M11382028"
 STUDENT_NAME = "李景詮"
-LOCATION = "大同路二段與健康路一段口(北)"
+LOCATION = "大同路二段與健康路一段口(北"
 
-# 遠端 CCTV 串流 URL
+# CCTV 串流 URL
 VIDEO_URL = "https://trafficvideo2.tainan.gov.tw/54b2e135"
 
-# 股票代碼
-STOCK_SYMBOL = "2330.TW"
-STOCK_URL = f"https://tw.stock.yahoo.com/quote/{STOCK_SYMBOL}"
+# 股票代碼與名稱對應
+STOCKS = {
+    "2330.TW": "台積電",
+    "2317.TW": "鴻海",
+    "2382.TW": "廣達"
+}
 
-@app.route("/snapshot")
-def snapshot():
-    try:
-        cap = cv2.VideoCapture(VIDEO_URL)
-        if not cap.isOpened():
-            return Response("無法開啟影像來源", status=503)
+def generate_frames():
+    cap = cv2.VideoCapture(VIDEO_URL)
 
+    if not cap.isOpened():
+        yield b''
+        return
+
+    while True:
         success, frame = cap.read()
-        cap.release()
-
         if not success:
-            return Response("無法讀取影像", status=503)
+            cap.release()
+            cap = cv2.VideoCapture(VIDEO_URL)
+            continue
 
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
-            return Response("影像編碼失敗", status=500)
+            continue
 
-        return Response(buffer.tobytes(), mimetype='image/jpeg')
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-    except Exception as e:
-        return Response(f"伺服器錯誤：{str(e)}", status=500)
+def fetch_stock_info(stock_code):
+    url = f'https://tw.stock.yahoo.com/quote/{stock_code}'
+    res = requests.get(url)
+    soup = BeautifulSoup(res.text, "html.parser")
 
-@app.route("/stock")
-def stock():
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-        res = requests.get(STOCK_URL, headers=headers)
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        title = soup.find("h1").get_text()
-        price = soup.select_one(".Fz\\(32px\\)").get_text()
-        diff = soup.select_one(".Fz\\(20px\\)").get_text()
-
-        # 判斷漲跌
-        if soup.select("#main-0-QuoteHeader-Proxy .C\\(\\$c-trend-up\\)"):
-            sign = "+"
-        elif soup.select("#main-0-QuoteHeader-Proxy .C\\(\\$c-trend-down\\)"):
-            sign = "-"
+        title = soup.find('h1').get_text(strip=True)
+        price = soup.select_one('.Fz\\(32px\\)').get_text(strip=True)
+        change = soup.select_one('.Fz\\(20px\\)').get_text(strip=True)
+        
+        if soup.select_one('.C\\(\\$c-trend-down\\)'):
+            sign = '-'
+        elif soup.select_one('.C\\(\\$c-trend-up\\)'):
+            sign = '+'
         else:
-            sign = ""
-
-        return f"{title} : {price} ({sign}{diff})"
-
-    except Exception as e:
-        return f"取得股票資訊失敗：{str(e)}"
+            sign = ''
+        return f"{title} : {price} ({sign}{change})"
+    except Exception:
+        return f"{stock_code} 資料錯誤"
 
 @app.route("/")
 def index():
     return render_template_string("""
-    <!doctype html>
-    <html lang="zh-TW">
+    <html>
     <head>
-        <meta charset="utf-8">
-        <title>台南即時監視器 + 台積電股價</title>
-        <style>
-            body { font-family: sans-serif; padding: 20px; }
-            img { border: 2px solid #ccc; }
-        </style>
+        <meta charset="UTF-8">
+        <title>台南即時監視器</title>
     </head>
     <body>
-        <h1>台南即時影像與股價資訊</h1>
+        <h1>台南即時影像串流</h1>
         <p><strong>學號：</strong>{{ student_id }}</p>
         <p><strong>姓名：</strong>{{ student_name }}</p>
         <p><strong>監視器位置：</strong>{{ location }}</p>
-
-        <h2>🎥 即時影像（每秒更新）</h2>
-        <img id="video" width="640" height="480" src="{{ url_for('snapshot') }}">
-
-        <h2>📈 台積電股價（每 30 秒更新）</h2>
-        <div id="stock">載入中...</div>
-
-        <script>
-            // 每秒更新影像
-            function reloadImage() {
-                const img = document.getElementById("video");
-                img.src = "{{ url_for('snapshot') }}" + "?" + new Date().getTime();
-            }
-            setInterval(reloadImage, 1000);
-
-            // 每 30 秒更新股價
-            async function updateStock() {
-                const res = await fetch("/stock");
-                const text = await res.text();
-                document.getElementById("stock").innerText = text;
-            }
-            updateStock();
-            setInterval(updateStock, 30000);
-        </script>
+        <img src="{{ url_for('video_feed') }}" width="640" height="480">
+        <hr>
+        <p><a href="/stocks">查看台股資訊</a></p>
     </body>
     </html>
     """, student_id=STUDENT_ID, student_name=STUDENT_NAME, location=LOCATION)
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/stocks")
+def stock_page():
+    stock_data = [fetch_stock_info(code) for code in STOCKS]
+    return render_template_string("""
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>即時股價</title>
+    </head>
+    <body>
+        <h1>即時股價資訊</h1>
+        <ul>
+        {% for stock in stock_data %}
+            <li>{{ stock }}</li>
+        {% endfor %}
+        </ul>
+        <a href="/">返回即時監視器</a>
+    </body>
+    </html>
+    """, stock_data=stock_data)
 
 @app.route("/test")
 def home():
@@ -117,3 +114,4 @@ def home():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
